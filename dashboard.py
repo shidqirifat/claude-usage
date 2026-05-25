@@ -8,8 +8,24 @@ import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
+from urllib.request import urlopen
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+# Fetched once at startup; None if unavailable
+_USD_TO_IDR = None
+
+
+def _fetch_usd_to_idr():
+    global _USD_TO_IDR
+    try:
+        with urlopen("https://open.er-api.com/v6/latest/USD", timeout=5) as r:
+            data = json.loads(r.read())
+        _USD_TO_IDR = data["rates"]["IDR"]
+        print(f"Exchange rate fetched: 1 USD = {_USD_TO_IDR:,.0f} IDR")
+    except Exception as e:
+        print(f"Warning: could not fetch exchange rate: {e}")
+        _USD_TO_IDR = None
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -198,6 +214,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: rgba(255,255,255,0.02); }
+  tr.project-row { cursor: pointer; }
+  tr.project-row td:first-child { user-select: none; }
+  tr.branch-row td { background: rgba(255,255,255,0.015); padding-top: 7px; padding-bottom: 7px; font-size: 12px; border-bottom-color: transparent; }
+  tr.branch-row:last-of-type td { border-bottom: 1px solid var(--border); }
+  tr.branch-row td:first-child { padding-left: 32px; color: var(--muted); font-family: monospace; }
+  .expand-icon { display: inline-block; width: 14px; color: var(--muted); font-size: 10px; transition: transform 0.15s; }
+  .expand-icon.open { transform: rotate(90deg); }
   .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(79,142,247,0.15); color: var(--blue); }
   .cost { color: var(--green); font-family: monospace; }
   .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
@@ -285,7 +308,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <th class="sortable" onclick="setModelSort('output')">Output <span class="sort-icon" id="msort-output"></span></th>
         <th class="sortable" onclick="setModelSort('cache_read')">Cache Read <span class="sort-icon" id="msort-cache_read"></span></th>
         <th class="sortable" onclick="setModelSort('cache_creation')">Cache Creation <span class="sort-icon" id="msort-cache_creation"></span></th>
-        <th class="sortable" onclick="setModelSort('cost')">Est. Cost <span class="sort-icon" id="msort-cost"></span></th>
+        <th class="sortable" onclick="setModelSort('cost')">Est. Cost (USD) <span class="sort-icon" id="msort-cost"></span></th>
+        <th>Est. Cost (IDR)</th>
       </tr></thead>
       <tbody id="model-cost-body"></tbody>
     </table>
@@ -302,7 +326,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <th class="sortable" onclick="setSessionSort('turns')">Turns <span class="sort-icon" id="sort-icon-turns"></span></th>
         <th class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
         <th class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
-        <th class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
+        <th class="sortable" onclick="setSessionSort('cost')">Est. Cost (USD) <span class="sort-icon" id="sort-icon-cost"></span></th>
+        <th>Est. Cost (IDR)</th>
       </tr></thead>
       <tbody id="sessions-body"></tbody>
     </table>
@@ -316,24 +341,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <th class="sortable" onclick="setProjectSort('turns')">Turns <span class="sort-icon" id="psort-turns"></span></th>
         <th class="sortable" onclick="setProjectSort('input')">Input <span class="sort-icon" id="psort-input"></span></th>
         <th class="sortable" onclick="setProjectSort('output')">Output <span class="sort-icon" id="psort-output"></span></th>
-        <th class="sortable" onclick="setProjectSort('cost')">Est. Cost <span class="sort-icon" id="psort-cost"></span></th>
+        <th class="sortable" onclick="setProjectSort('cost')">Est. Cost (USD) <span class="sort-icon" id="psort-cost"></span></th>
+        <th>Est. Cost (IDR)</th>
       </tr></thead>
       <tbody id="project-cost-body"></tbody>
-    </table>
-  </div>
-  <div class="table-card">
-    <div class="section-header"><div class="section-title">Cost by Project &amp; Branch</div><button class="export-btn" onclick="exportProjectBranchCSV()" title="Export project+branch breakdown to CSV">&#x2913; CSV</button></div>
-    <table>
-      <thead><tr>
-        <th>Project</th>
-        <th>Branch</th>
-        <th class="sortable" onclick="setProjectBranchSort('sessions')">Sessions <span class="sort-icon" id="pbsort-sessions"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('turns')">Turns <span class="sort-icon" id="pbsort-turns"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('input')">Input <span class="sort-icon" id="pbsort-input"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('output')">Output <span class="sort-icon" id="pbsort-output"></span></th>
-        <th class="sortable" onclick="setProjectBranchSort('cost')">Est. Cost <span class="sort-icon" id="pbsort-cost"></span></th>
-      </tr></thead>
-      <tbody id="project-branch-cost-body"></tbody>
     </table>
   </div>
 </div>
@@ -369,9 +380,9 @@ let modelSortCol = 'cost';
 let modelSortDir = 'desc';
 let projectSortCol = 'cost';
 let projectSortDir = 'desc';
-let branchSortCol = 'cost';
-let branchSortDir = 'desc';
 let lastFilteredSessions = [];
+let lastByModel = [];
+let lastByModelProject = [];
 let lastByProject = [];
 let lastByProjectBranch = [];
 let sessionSortDir = 'desc';
@@ -470,6 +481,22 @@ function fmt(n) {
 }
 function fmtCost(c)    { return '$' + c.toFixed(4); }
 function fmtCostBig(c) { return '$' + c.toFixed(2); }
+
+// ── IDR exchange rate (fetched once) ───────────────────────────────────────
+let usdToIdr = null;
+function fmtIdr(usd) {
+  if (usdToIdr === null) return '—';
+  const idr = usd * usdToIdr;
+  if (idr >= 1e6) return 'Rp' + (idr / 1e6).toFixed(2) + 'M';
+  return 'Rp' + Math.round(idr).toLocaleString('id-ID');
+}
+function fmtIdrBig(usd) {
+  if (usdToIdr === null) return '—';
+  const idr = usd * usdToIdr;
+  if (idr >= 1e9) return 'Rp' + (idr / 1e9).toFixed(2) + 'B';
+  if (idr >= 1e6) return 'Rp' + (idr / 1e6).toFixed(2) + 'M';
+  return 'Rp' + Math.round(idr).toLocaleString('id-ID');
+}
 
 // ── Chart colors ───────────────────────────────────────────────────────────
 const TOKEN_COLORS = {
@@ -713,6 +740,22 @@ function applyFilter() {
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
+  // By model+project: for expand-drill-down in Cost by Model table
+  const modelProjMap = {};
+  for (const s of filteredSessions) {
+    const key = s.model + '\u0000' + s.project;
+    if (!modelProjMap[key]) modelProjMap[key] = { model: s.model, project: s.project, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, cost: 0 };
+    const mp = modelProjMap[key];
+    mp.input          += s.input;
+    mp.output         += s.output;
+    mp.cache_read     += s.cache_read;
+    mp.cache_creation += s.cache_creation;
+    mp.turns          += s.turns;
+    mp.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+  }
+  const byModelProject = Object.values(modelProjMap);
+
+
   // By project+branch: aggregate from filtered sessions
   const projBranchMap = {};
   for (const s of filteredSessions) {
@@ -742,7 +785,7 @@ function applyFilter() {
 
   // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+    selectedModels.has(r.model) && (!start || r.day >= start)
   );
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
 
@@ -757,11 +800,12 @@ function applyFilter() {
   renderProjectChart(byProject);
   lastFilteredSessions = sortSessions(filteredSessions);
   lastByProject = sortProjects(byProject);
-  lastByProjectBranch = sortProjectBranch(byProjectBranch);
+  lastByProjectBranch = byProjectBranch;
   renderSessionsTable(lastFilteredSessions.slice(0, 20));
-  renderModelCostTable(byModel);
-  renderProjectCostTable(lastByProject.slice(0, 20));
-  renderProjectBranchCostTable(lastByProjectBranch.slice(0, 20));
+  lastByModel = byModel;
+  lastByModelProject = byModelProject;
+  renderModelCostTable(byModel, byModelProject);
+  renderProjectCostTable(lastByProject, lastByProjectBranch);
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -774,7 +818,8 @@ function renderStats(t) {
     { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
+    { label: 'Est. Cost (USD)', value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
+    { label: 'Est. Cost (IDR)', value: fmtIdrBig(t.cost),          sub: usdToIdr ? `1 USD = ${Math.round(usdToIdr).toLocaleString('id-ID')} IDR` : 'rate unavailable', color: '#4ade80' },
   ];
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
@@ -958,8 +1003,8 @@ function renderSessionsTable(sessions) {
   document.getElementById('sessions-body').innerHTML = sessions.map(s => {
     const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
     const costCell = isBillable(s.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
-      : `<td class="cost-na">n/a</td>`;
+      ? `<td class="cost">${fmtCost(cost)}</td><td class="cost">${fmtIdr(cost)}</td>`
+      : `<td class="cost-na">n/a</td><td class="cost-na">n/a</td>`;
     return `<tr>
       <td class="muted" style="font-family:monospace">${esc(s.session_id)}&hellip;</td>
       <td>${esc(s.project)}</td>
@@ -1007,22 +1052,73 @@ function sortModels(byModel) {
   });
 }
 
-function renderModelCostTable(byModel) {
-  document.getElementById('model-cost-body').innerHTML = sortModels(byModel).map(m => {
+const expandedModels = new Set();
+
+function toggleModelExpand(model) {
+  if (expandedModels.has(model)) {
+    expandedModels.delete(model);
+  } else {
+    expandedModels.add(model);
+  }
+  renderModelCostTable(lastByModel, lastByModelProject);
+}
+
+document.addEventListener('click', function(e) {
+  const row = e.target.closest('tr.model-row');
+  if (!row || !row.dataset.model) return;
+  toggleModelExpand(decodeURIComponent(row.dataset.model));
+});
+
+function renderModelCostTable(byModel, byModelProject) {
+  // Build lookup: model -> projects sorted by cost desc
+  const projByModel = {};
+  for (const mp of (byModelProject || [])) {
+    if (!projByModel[mp.model]) projByModel[mp.model] = [];
+    projByModel[mp.model].push(mp);
+  }
+  for (const projs of Object.values(projByModel)) {
+    projs.sort((a, b) => b.cost - a.cost);
+  }
+
+  const rows = [];
+  for (const m of sortModels(byModel)) {
     const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
+    const projs = projByModel[m.model] || [];
+    const isOpen = expandedModels.has(m.model);
+    const expandCell = projs.length
+      ? `<span class="expand-icon${isOpen ? ' open' : ''}">&#9654;</span>`
+      : `<span class="expand-icon" style="visibility:hidden">&#9654;</span>`;
     const costCell = isBillable(m.model)
-      ? `<td class="cost">${fmtCost(cost)}</td>`
-      : `<td class="cost-na">n/a</td>`;
-    return `<tr>
-      <td><span class="model-tag">${esc(m.model)}</span></td>
+      ? `<td class="cost">${fmtCost(cost)}</td><td class="cost">${fmtIdr(cost)}</td>`
+      : `<td class="cost-na">n/a</td><td class="cost-na">n/a</td>`;
+
+    rows.push(`<tr class="model-row" data-model="${encodeURIComponent(m.model)}">
+      <td>${expandCell} <span class="model-tag">${esc(m.model)}</span></td>
       <td class="num">${fmt(m.turns)}</td>
       <td class="num">${fmt(m.input)}</td>
       <td class="num">${fmt(m.output)}</td>
       <td class="num">${fmt(m.cache_read)}</td>
       <td class="num">${fmt(m.cache_creation)}</td>
       ${costCell}
-    </tr>`;
-  }).join('');
+    </tr>`);
+
+    if (isOpen) {
+      for (const mp of projs) {
+        const mpCost = mp.cost;
+        rows.push(`<tr class="branch-row">
+          <td style="padding-left:32px">${esc(mp.project)}</td>
+          <td class="num">${fmt(mp.turns)}</td>
+          <td class="num">${fmt(mp.input)}</td>
+          <td class="num">${fmt(mp.output)}</td>
+          <td class="num">${fmt(mp.cache_read)}</td>
+          <td class="num">${fmt(mp.cache_creation)}</td>
+          <td class="cost">${fmtCost(mpCost)}</td>
+          <td class="cost">${fmtIdr(mpCost)}</td>
+        </tr>`);
+      }
+    }
+  }
+  document.getElementById('model-cost-body').innerHTML = rows.join('');
 }
 
 // ── Project cost table sorting ────────────────────────────────────────────
@@ -1053,64 +1149,71 @@ function sortProjects(byProject) {
   });
 }
 
-function renderProjectCostTable(byProject) {
-  document.getElementById('project-cost-body').innerHTML = sortProjects(byProject).map(p => {
-    return `<tr>
-      <td>${esc(p.project)}</td>
+function renderProjectCostTable(byProject, byProjectBranch) {
+  // Build lookup: project -> sorted branch rows
+  const branchByProject = {};
+  for (const pb of (byProjectBranch || [])) {
+    if (!branchByProject[pb.project]) branchByProject[pb.project] = [];
+    branchByProject[pb.project].push(pb);
+  }
+  for (const branches of Object.values(branchByProject)) {
+    branches.sort((a, b) => b.cost - a.cost);
+  }
+
+  const rows = [];
+  for (const p of sortProjects(byProject)) {
+    const branches = branchByProject[p.project] || [];
+    const hasBranches = branches.length > 1 || (branches.length === 1 && branches[0].branch);
+    const isOpen = expandedProjects.has(p.project);
+    const expandCell = hasBranches
+      ? `<span class="expand-icon${isOpen ? ' open' : ''}">&#9654;</span>`
+      : `<span class="expand-icon" style="visibility:hidden">&#9654;</span>`;
+
+    rows.push(`<tr class="project-row" data-project="${encodeURIComponent(p.project)}">
+      <td>${expandCell} ${esc(p.project)}</td>
       <td class="num">${p.sessions}</td>
       <td class="num">${fmt(p.turns)}</td>
       <td class="num">${fmt(p.input)}</td>
       <td class="num">${fmt(p.output)}</td>
       <td class="cost">${fmtCost(p.cost)}</td>
-    </tr>`;
-  }).join('');
-}
+      <td class="cost">${fmtIdr(p.cost)}</td>
+    </tr>`);
 
-// ── Project+Branch cost table sorting ────────────────────────────────────
-function setProjectBranchSort(col) {
-  if (branchSortCol === col) {
-    branchSortDir = branchSortDir === 'desc' ? 'asc' : 'desc';
-  } else {
-    branchSortCol = col;
-    branchSortDir = 'desc';
+    if (isOpen && hasBranches) {
+      for (const pb of branches) {
+        rows.push(`<tr class="branch-row">
+          <td>${esc(pb.branch || '—')}</td>
+          <td class="num">${pb.sessions}</td>
+          <td class="num">${fmt(pb.turns)}</td>
+          <td class="num">${fmt(pb.input)}</td>
+          <td class="num">${fmt(pb.output)}</td>
+          <td class="cost">${fmtCost(pb.cost)}</td>
+          <td class="cost">${fmtIdr(pb.cost)}</td>
+        </tr>`);
+      }
+    }
   }
-  updateProjectBranchSortIcons();
-  applyFilter();
+  document.getElementById('project-cost-body').innerHTML = rows.join('');
 }
 
-function updateProjectBranchSortIcons() {
-  document.querySelectorAll('[id^="pbsort-"]').forEach(el => el.textContent = '');
-  const icon = document.getElementById('pbsort-' + branchSortCol);
-  if (icon) icon.textContent = branchSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
+// expandedProjects tracks which project names are currently expanded
+const expandedProjects = new Set();
+
+function toggleProjectExpand(project) {
+  if (expandedProjects.has(project)) {
+    expandedProjects.delete(project);
+  } else {
+    expandedProjects.add(project);
+  }
+  renderProjectCostTable(lastByProject, lastByProjectBranch);
 }
 
-function sortProjectBranch(rows) {
-  return [...rows].sort((a, b) => {
-    const pa = (a.project || '').toLowerCase();
-    const pb = (b.project || '').toLowerCase();
-    if (pa < pb) return -1;
-    if (pa > pb) return 1;
-    const av = a[branchSortCol] ?? 0;
-    const bv = b[branchSortCol] ?? 0;
-    if (av < bv) return branchSortDir === 'desc' ? 1 : -1;
-    if (av > bv) return branchSortDir === 'desc' ? -1 : 1;
-    return 0;
-  });
-}
-
-function renderProjectBranchCostTable(rows) {
-  document.getElementById('project-branch-cost-body').innerHTML = sortProjectBranch(rows).map(pb => {
-    return `<tr>
-      <td>${esc(pb.project)}</td>
-      <td class="muted" style="font-family:monospace">${esc(pb.branch || '\u2014')}</td>
-      <td class="num">${pb.sessions}</td>
-      <td class="num">${fmt(pb.turns)}</td>
-      <td class="num">${fmt(pb.input)}</td>
-      <td class="num">${fmt(pb.output)}</td>
-      <td class="cost">${fmtCost(pb.cost)}</td>
-    </tr>`;
-  }).join('');
-}
+document.addEventListener('click', function(e) {
+  const row = e.target.closest('tr.project-row');
+  if (!row) return;
+  const project = decodeURIComponent(row.dataset.project);
+  if (row.dataset.project !== undefined) toggleProjectExpand(project);
+});
 
 // ── CSV Export ────────────────────────────────────────────────────────────
 function csvField(val) {
@@ -1157,13 +1260,6 @@ function exportProjectsCSV() {
   downloadCSV('projects', header, rows);
 }
 
-function exportProjectBranchCSV() {
-  const header = ['Project', 'Branch', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
-  const rows = lastByProjectBranch.map(pb => {
-    return [pb.project, pb.branch, pb.sessions, pb.turns, pb.input, pb.output, pb.cache_read, pb.cache_creation, pb.cost.toFixed(4)];
-  });
-  downloadCSV('projects_by_branch', header, rows);
-}
 
 // ── Rescan ────────────────────────────────────────────────────────────────
 async function triggerRescan() {
@@ -1198,6 +1294,12 @@ async function loadData() {
     rawData = d;
 
     if (isFirstLoad) {
+      // Fetch exchange rate once
+      fetch('/api/exchange-rate').then(r => r.json()).then(d => {
+        usdToIdr = d.usd_to_idr;
+        applyFilter();
+      }).catch(() => {});
+
       // Restore range from URL, mark active button
       selectedRange = readURLRange();
       document.querySelectorAll('.range-btn').forEach(btn =>
@@ -1212,7 +1314,6 @@ async function loadData() {
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
-      updateProjectBranchSortIcons();
     }
 
     applyFilter();
@@ -1257,6 +1358,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif self.path == "/api/exchange-rate":
+            body = json.dumps({"usd_to_idr": _USD_TO_IDR}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -1290,6 +1399,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 def serve(host=None, port=None):
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
+    _fetch_usd_to_idr()
     server = HTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
